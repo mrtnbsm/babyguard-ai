@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "BabyGuard AI",
+    "slug": "babyguard-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "babyguard",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B1426"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.babyguard.ai",
+      "infoPlist": {
+        "NSCameraUsageDescription": "BabyGuard AI uses the camera to stream video to the parent unit.",
+        "NSMicrophoneUsageDescription": "BabyGuard AI uses the microphone to monitor baby sounds."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B1426"
+      },
+      "package": "com.babyguard.ai",
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "INTERNET",
+        "VIBRATE",
+        "WAKE_LOCK"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-notifications"
+    ]
+  }
+}
