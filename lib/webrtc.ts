@@ -15,7 +15,7 @@ const MAX_QUEUE = 5;
 // of .caf (LinearPCM). Both platforms then produce files the other can play.
 // We dial down sample rate / bitrate to keep chunk sizes small (~6 KB base64).
 const RECORDING_OPTIONS: Audio.RecordingOptions = {
-  isMeteringEnabled: false,
+  isMeteringEnabled: true,
   android: {
     ...Audio.RecordingOptionsPresets.HIGH_QUALITY.android,
     sampleRate: 16000,
@@ -41,6 +41,7 @@ export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'error
 type Callbacks = {
   onStatus: (s: SessionStatus) => void;
   onError: (msg: string) => void;
+  onVolume?: (v: number) => void;
 };
 
 // ─── Singleton ─────────────────────────────────────────────────────────────────
@@ -134,8 +135,11 @@ export class WebRTCSession {
     if (this.role === 'parent') {
       ch.on('broadcast', { event: 'audio_chunk' }, ({ payload }: any) => {
         if (payload?.data) {
-          console.log(`[BabyGuard] parent received chunk, b64 len=${payload.data.length}, queue=${this.queue.length}`);
+          console.log(`[BabyGuard] parent received chunk, b64 len=${payload.data.length}, vol=${payload.volume?.toFixed(2) ?? 'n/a'}, queue=${this.queue.length}`);
           this.enqueue(payload.data as string);
+          if (typeof payload.volume === 'number') {
+            this.cb.onVolume?.(payload.volume);
+          }
         }
       });
     }
@@ -179,7 +183,19 @@ export class WebRTCSession {
         const rec = new Audio.Recording();
         await rec.prepareToRecordAsync(RECORDING_OPTIONS);
         await rec.startAsync();
-        await sleep(CHUNK_MS);
+        await sleep(CHUNK_MS - 30);
+
+        // Sample metering while still recording
+        let volume = 0;
+        try {
+          const status = await rec.getStatusAsync();
+          if (status.isRecording && typeof (status as any).metering === 'number') {
+            // Normalize dBFS to 0–1: -60 dBFS → 0, -6 dBFS → 1
+            volume = Math.max(0, Math.min(1, ((status as any).metering + 60) / 54));
+          }
+        } catch { /* volume stays 0 */ }
+
+        await sleep(30);
         await rec.stopAndUnloadAsync();
 
         if (!this.active || !this.channel) break;
@@ -196,12 +212,12 @@ export class WebRTCSession {
         FileSystem.deleteAsync(uri, { idempotent: true }); // fire-and-forget
 
         chunkIndex++;
-        console.log(`[BabyGuard] chunk ${chunkIndex}: ${b64.length} base64 chars, broadcasting…`);
+        console.log(`[BabyGuard] chunk ${chunkIndex}: ${b64.length} base64 chars, vol=${volume.toFixed(2)}, broadcasting…`);
 
         this.channel.send({
           type: 'broadcast',
           event: 'audio_chunk',
-          payload: { data: b64 },
+          payload: { data: b64, volume },
         });
       } catch (err: any) {
         console.error('[BabyGuard] recording error:', err?.message ?? err);
