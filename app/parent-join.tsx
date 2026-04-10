@@ -1,14 +1,39 @@
-import { useState } from 'react';
-import { View, Text, TouchableOpacity, ActivityIndicator, StyleSheet } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import {
+  View, Text, TouchableOpacity, ActivityIndicator,
+  StyleSheet, Animated,
+} from 'react-native';
 import { router } from 'expo-router';
 import { checkRoomExists } from '@/lib/webrtc';
 
-const KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', '⌫'];
+const KEYS = ['1','2','3','4','5','6','7','8','9','','0','⌫'];
 
 export default function ParentJoinScreen() {
-  const [code, setCode] = useState('');
+  const [code,     setCode]     = useState('');
   const [checking, setChecking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error,    setError]    = useState<string | null>(null);
+
+  const fadeIn  = useRef(new Animated.Value(0)).current;
+  const slideUp = useRef(new Animated.Value(20)).current;
+  // Shake animation for wrong code
+  const shake = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fadeIn,  { toValue: 1, duration: 500, useNativeDriver: true }),
+      Animated.timing(slideUp, { toValue: 0, duration: 500, useNativeDriver: true }),
+    ]).start();
+  }, []);
+
+  function triggerShake() {
+    Animated.sequence([
+      Animated.timing(shake, { toValue:  8, duration: 60, useNativeDriver: true }),
+      Animated.timing(shake, { toValue: -8, duration: 60, useNativeDriver: true }),
+      Animated.timing(shake, { toValue:  6, duration: 60, useNativeDriver: true }),
+      Animated.timing(shake, { toValue: -6, duration: 60, useNativeDriver: true }),
+      Animated.timing(shake, { toValue:  0, duration: 60, useNativeDriver: true }),
+    ]).start();
+  }
 
   function pressKey(key: string) {
     setError(null);
@@ -28,11 +53,13 @@ export default function ParentJoinScreen() {
       if (!exists) {
         setError('Room not found — is the baby device running?');
         setCode('');
+        triggerShake();
         return;
       }
       router.push({ pathname: '/parent-monitor', params: { code } });
     } catch {
-      setError('Could not reach Supabase. Check your connection.');
+      setError('Could not reach server. Check your connection.');
+      triggerShake();
     } finally {
       setChecking(false);
     }
@@ -43,53 +70,64 @@ export default function ParentJoinScreen() {
 
   return (
     <View style={styles.container}>
-      <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
-        <Text style={styles.backText}>← Back</Text>
-      </TouchableOpacity>
+      <Animated.View style={[styles.inner, { opacity: fadeIn, transform: [{ translateY: slideUp }] }]}>
 
-      <Text style={styles.title}>Enter Room Code</Text>
-      <Text style={styles.subtitle}>Type the 6-digit code shown on the baby's device.</Text>
+        {/* Back */}
+        <TouchableOpacity style={styles.backBtn} onPress={() => router.back()} activeOpacity={0.7}>
+          <Text style={styles.backText}>‹  Back</Text>
+        </TouchableOpacity>
 
-      {/* Digit slots */}
-      <View style={styles.slots}>
-        {slots.map((digit, i) => (
-          <View key={i} style={[styles.slot, digit ? styles.slotFilled : null]}>
-            <Text style={styles.slotText}>{digit}</Text>
-          </View>
-        ))}
-      </View>
+        <Text style={styles.title}>Enter Room Code</Text>
+        <Text style={styles.subtitle}>
+          Type the 6-digit code shown on the baby's device.
+        </Text>
 
-      {error && <Text style={styles.errorText}>{error}</Text>}
+        {/* Digit slots with shake on error */}
+        <Animated.View style={[styles.slots, { transform: [{ translateX: shake }] }]}>
+          {slots.map((digit, i) => (
+            <View key={i} style={[styles.slot, digit ? styles.slotFilled : null]}>
+              <Text style={styles.slotText}>{digit || ' '}</Text>
+            </View>
+          ))}
+        </Animated.View>
 
-      {/* Number pad */}
-      <View style={styles.pad}>
-        {KEYS.map((key, i) => {
-          if (key === '') return <View key={i} style={styles.keyEmpty} />;
-          const isDel = key === '⌫';
-          return (
-            <TouchableOpacity
-              key={i}
-              style={[styles.key, isDel && styles.keyDel]}
-              onPress={() => pressKey(key)}
-              activeOpacity={0.6}
-            >
-              <Text style={[styles.keyText, isDel && styles.keyDelText]}>{key}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
+        {/* Error message */}
+        <View style={styles.errorWrap}>
+          {error && <Text style={styles.errorText}>{error}</Text>}
+        </View>
 
-      {/* Connect */}
-      <TouchableOpacity
-        style={[styles.connectBtn, !canConnect && styles.connectBtnDisabled]}
-        disabled={!canConnect}
-        onPress={handleConnect}
-      >
-        {checking
-          ? <ActivityIndicator color="#0B1426" />
-          : <Text style={styles.connectText}>Connect</Text>
-        }
-      </TouchableOpacity>
+        {/* Number pad */}
+        <View style={styles.pad}>
+          {KEYS.map((key, i) => {
+            if (key === '') return <View key={i} style={styles.keyEmpty} />;
+            const isDel = key === '⌫';
+            return (
+              <TouchableOpacity
+                key={i}
+                style={[styles.key, isDel && styles.keyDel]}
+                onPress={() => pressKey(key)}
+                activeOpacity={0.55}
+              >
+                <Text style={[styles.keyText, isDel && styles.keyDelText]}>{key}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        {/* Connect button */}
+        <TouchableOpacity
+          style={[styles.connectBtn, !canConnect && styles.connectBtnDisabled]}
+          disabled={!canConnect}
+          onPress={handleConnect}
+          activeOpacity={0.85}
+        >
+          {checking
+            ? <ActivityIndicator color="#0B1426" />
+            : <Text style={styles.connectText}>Connect</Text>
+          }
+        </TouchableOpacity>
+
+      </Animated.View>
     </View>
   );
 }
@@ -98,42 +136,95 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0B1426',
+  },
+  inner: {
+    flex: 1,
     paddingHorizontal: 28,
-    paddingTop: 64,
-    paddingBottom: 32,
+    paddingTop: 60,
+    paddingBottom: 36,
   },
-  backBtn: { marginBottom: 32 },
-  backText: { color: '#F5C06E', fontSize: 15 },
-  title: { color: '#FFF', fontSize: 30, fontWeight: 'bold', marginBottom: 8 },
-  subtitle: { color: 'rgba(255,255,255,0.45)', fontSize: 15, marginBottom: 36, lineHeight: 22 },
-  errorText: { color: '#E8534A', fontSize: 13, textAlign: 'center', marginTop: -16, marginBottom: 8 },
 
-  slots: { flexDirection: 'row', justifyContent: 'center', gap: 10, marginBottom: 28 },
+  backBtn:  { marginBottom: 28 },
+  backText: { color: '#F5C06E', fontSize: 16, fontWeight: '500' },
+
+  title: {
+    color: '#FFFFFF',
+    fontSize: 30,
+    fontWeight: 'bold',
+    letterSpacing: -0.4,
+    marginBottom: 8,
+  },
+  subtitle: {
+    color: 'rgba(255,255,255,0.40)',
+    fontSize: 15,
+    lineHeight: 22,
+    marginBottom: 36,
+  },
+
+  // Digit slots
+  slots: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 9,
+    marginBottom: 12,
+  },
   slot: {
-    width: 46, height: 58, borderRadius: 12,
-    backgroundColor: '#132040',
-    borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.1)',
-    alignItems: 'center', justifyContent: 'center',
+    width: 48,
+    height: 60,
+    borderRadius: 14,
+    backgroundColor: '#0D1935',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.09)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  slotFilled: { borderColor: '#F5C06E', backgroundColor: 'rgba(245,192,110,0.08)' },
-  slotText: { color: '#F5C06E', fontSize: 24, fontWeight: 'bold' },
+  slotFilled: {
+    borderColor: '#F5C06E',
+    backgroundColor: 'rgba(245,192,110,0.07)',
+  },
+  slotText: {
+    color: '#F5C06E',
+    fontSize: 26,
+    fontWeight: 'bold',
+  },
 
-  pad: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 14, marginBottom: 28 },
-  key: {
-    width: 80, height: 64, borderRadius: 16,
-    backgroundColor: '#132040',
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.07)',
+  errorWrap: { height: 22, alignItems: 'center', marginBottom: 16 },
+  errorText: { color: '#E8534A', fontSize: 13 },
+
+  // Keypad
+  pad: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 12,
+    marginBottom: 28,
   },
-  keyEmpty: { width: 80, height: 64 },
-  keyDel: { backgroundColor: 'rgba(232,83,74,0.15)', borderColor: 'rgba(232,83,74,0.25)' },
-  keyText: { color: '#FFF', fontSize: 24, fontWeight: '500' },
+  key: {
+    width: 82,
+    height: 66,
+    borderRadius: 18,
+    backgroundColor: '#0D1935',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.07)',
+  },
+  keyEmpty: { width: 82, height: 66 },
+  keyDel: {
+    backgroundColor: 'rgba(232,83,74,0.12)',
+    borderColor: 'rgba(232,83,74,0.22)',
+  },
+  keyText:    { color: '#FFFFFF', fontSize: 24, fontWeight: '500' },
   keyDelText: { color: '#E8534A' },
 
+  // Connect
   connectBtn: {
-    backgroundColor: '#F5C06E', borderRadius: 16,
-    paddingVertical: 18, alignItems: 'center', marginTop: 'auto',
+    backgroundColor: '#F5C06E',
+    borderRadius: 18,
+    paddingVertical: 18,
+    alignItems: 'center',
+    marginTop: 'auto',
   },
-  connectBtnDisabled: { opacity: 0.35 },
+  connectBtnDisabled: { opacity: 0.30 },
   connectText: { color: '#0B1426', fontSize: 17, fontWeight: '700' },
 });

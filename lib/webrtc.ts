@@ -95,6 +95,27 @@ export class WebRTCSession {
   // ─── Channel ─────────────────────────────────────────────────────────────────
 
   private async joinChannel() {
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        await this.attemptSubscribe();
+        return; // success — exit the retry loop
+      } catch (err: any) {
+        console.error(`[BabyGuard] channel attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err?.message ?? err);
+        if (attempt === MAX_ATTEMPTS) throw err;
+        console.log('[BabyGuard] Retrying channel in 2 s…');
+        await sleep(2000);
+      }
+    }
+  }
+
+  private async attemptSubscribe() {
+    // Clean up any previous channel before creating a new one
+    if (this.channel) {
+      await supabase.removeChannel(this.channel);
+      this.channel = null;
+    }
+
     const ch = supabase.channel(`room:${this.roomCode}`, {
       config: {
         broadcast: { self: false, ack: false },
@@ -120,7 +141,7 @@ export class WebRTCSession {
     }
 
     await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('Supabase channel timeout')), 10_000);
+      const t = setTimeout(() => reject(new Error('Channel connection timed out')), 15_000);
       ch.subscribe(async (status: string) => {
         if (status === 'SUBSCRIBED') {
           clearTimeout(t);

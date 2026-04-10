@@ -13,7 +13,14 @@ export default function RootLayout() {
   return (
     <>
       <StatusBar style="light" backgroundColor="#0B1426" />
-      <Stack screenOptions={{ headerShown: false }} />
+      <Stack
+        screenOptions={{
+          headerShown: false,
+          animation: 'fade',
+          animationDuration: 280,
+          contentStyle: { backgroundColor: '#0B1426' },
+        }}
+      />
     </>
   );
 }
