@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Alert } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import { Audio } from 'expo-av';
 import { useKeepAwake } from 'expo-keep-awake';
 import { router } from 'expo-router';
 import { useMonitorStore } from '@/stores/monitor-store';
@@ -13,15 +14,21 @@ export default function BabyUnitScreen() {
   const roomId = useMonitorStore((s) => s.roomId);
   const setStatus = useConnectionStore((s) => s.setStatus);
   const [camPermission, requestCamPermission] = useCameraPermissions();
+  const [audioPermission, requestAudioPermission] = Audio.usePermissions();
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>('connecting');
   const sessionRef = useRef<WebRTCSession | null>(null);
 
-  // Request camera permission once
+  // Request camera permission
   useEffect(() => {
     if (camPermission && !camPermission.granted) requestCamPermission();
   }, [camPermission?.granted]);
 
-  // Start WebRTC session (baby role = register room + wait for parent)
+  // Request microphone permission — needed before the recording loop starts
+  useEffect(() => {
+    if (audioPermission && !audioPermission.granted) requestAudioPermission();
+  }, [audioPermission?.granted]);
+
+  // Start audio streaming session
   useEffect(() => {
     const session = new WebRTCSession('baby', roomId, {
       onStatus: (s) => {
@@ -36,7 +43,6 @@ export default function BabyUnitScreen() {
     });
     sessionRef.current = session;
     session.start();
-
     return () => { session.stop(); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

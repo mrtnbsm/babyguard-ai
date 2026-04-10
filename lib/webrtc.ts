@@ -1,19 +1,40 @@
-import {
-  RTCPeerConnection,
-  RTCSessionDescription,
-  RTCIceCandidate,
-  mediaDevices,
-} from 'react-native-webrtc';
+// Audio streaming via Supabase Realtime broadcast — no native modules required,
+// works in Expo Go. Baby records 300 ms chunks and broadcasts them as base64;
+// parent receives each chunk, writes a temp file, and plays it sequentially.
+
+import { Audio, AVPlaybackStatus } from 'expo-av';
+import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from './supabase';
 
-// Public Google STUN servers — enough for same-network testing.
-// Add a TURN server here for cross-network reliability in production.
-const ICE_CONFIG = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
+// ─── Constants ─────────────────────────────────────────────────────────────────
+
+const CHUNK_MS = 300;
+const MAX_QUEUE = 5;
+
+// Derive from the HIGH_QUALITY preset so iOS produces .m4a (MPEG4AAC) instead
+// of .caf (LinearPCM). Both platforms then produce files the other can play.
+// We dial down sample rate / bitrate to keep chunk sizes small (~6 KB base64).
+const RECORDING_OPTIONS: Audio.RecordingOptions = {
+  isMeteringEnabled: false,
+  android: {
+    ...Audio.RecordingOptionsPresets.HIGH_QUALITY.android,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    bitRate: 32000,
+  },
+  ios: {
+    ...Audio.RecordingOptionsPresets.HIGH_QUALITY.ios,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    bitRate: 32000,
+  },
+  web: {
+    mimeType: 'audio/webm',
+    bitsPerSecond: 32000,
+  },
 };
+
+// ─── Types ─────────────────────────────────────────────────────────────────────
 
 export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
@@ -22,15 +43,18 @@ type Callbacks = {
   onError: (msg: string) => void;
 };
 
-// Module-level singleton so the session survives navigation between screens.
+// ─── Singleton ─────────────────────────────────────────────────────────────────
+
 let _active: WebRTCSession | null = null;
 export const getActiveSession = () => _active;
 
+// ─── Session ───────────────────────────────────────────────────────────────────
+
 export class WebRTCSession {
-  private pc: RTCPeerConnection | null = null;
   private channel: ReturnType<typeof supabase.channel> | null = null;
-  private localStream: any = null;
-  private joinRetry: ReturnType<typeof setInterval> | null = null;
+  private active = false;
+  private queue: string[] = [];
+  private draining = false;
 
   constructor(
     private readonly role: 'baby' | 'parent',
@@ -38,35 +62,29 @@ export class WebRTCSession {
     private readonly cb: Callbacks,
   ) {}
 
-  // ─── Public API ────────────────────────────────────────────────
+  // ─── Public ──────────────────────────────────────────────────────────────────
 
   async start() {
     _active = this;
+    this.active = true;
     this.cb.onStatus('connecting');
     try {
-      this.pc = new RTCPeerConnection(ICE_CONFIG);
-      this.wirePCEvents();
-      await this.subscribeToSignaling();
-      if (this.role === 'baby') {
-        await this.acquireMic();
-        // Baby registers the room by setting presence; waits for parent's 'join'
-      } else {
-        // Parent announces it has joined — baby will respond with an offer
-        this.sendJoin();
-        this.joinRetry = setInterval(() => this.sendJoin(), 3000);
-      }
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: this.role === 'baby',
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: true,
+        shouldDuckAndroid: false,
+      });
+      await this.joinChannel();
     } catch (err: any) {
+      console.error('[BabyGuard] start() failed:', err?.message ?? err);
       this.cb.onError(err?.message ?? 'Failed to start session');
       this.cb.onStatus('error');
     }
   }
 
   async stop() {
-    this.clearJoinRetry();
-    this.localStream?.getTracks().forEach((t: any) => t.stop());
-    this.localStream = null;
-    this.pc?.close();
-    this.pc = null;
+    this.active = false;
     if (this.channel) {
       await supabase.removeChannel(this.channel);
       this.channel = null;
@@ -74,47 +92,31 @@ export class WebRTCSession {
     if (_active === this) _active = null;
   }
 
-  // ─── PC events ─────────────────────────────────────────────────
+  // ─── Channel ─────────────────────────────────────────────────────────────────
 
-  private wirePCEvents() {
-    const pc = this.pc!;
-
-    pc.onicecandidate = ({ candidate }: any) => {
-      if (candidate) this.send('ice', { candidate: candidate.toJSON() });
-    };
-
-    pc.onconnectionstatechange = () => {
-      const s = (pc as any).connectionState as string;
-      if (s === 'connected') {
-        this.clearJoinRetry();
-        this.cb.onStatus('connected');
-      } else if (s === 'failed' || s === 'closed' || s === 'disconnected') {
-        this.cb.onStatus('disconnected');
-      }
-    };
-
-    // Remote audio plays automatically when the track arrives — no extra wiring needed.
-  }
-
-  // ─── Signaling via Supabase Realtime ───────────────────────────
-
-  private async subscribeToSignaling() {
+  private async joinChannel() {
     const ch = supabase.channel(`room:${this.roomCode}`, {
       config: {
-        broadcast: { self: false },
+        broadcast: { self: false, ack: false },
         presence: { key: this.role },
       },
     });
     this.channel = ch;
 
-    // Listen for WebRTC signals
-    ch.on('broadcast', { event: 'signal' }, ({ payload }: any) =>
-      this.handleSignal(payload),
-    );
+    ch.on('presence', { event: 'sync' }, () => {
+      const state = ch.presenceState<{ role: string }>();
+      const peer = this.role === 'baby' ? 'parent' : 'baby';
+      const peerOnline = Object.values(state).flat().some((p: any) => p.role === peer);
+      this.cb.onStatus(peerOnline ? 'connected' : 'connecting');
+    });
 
-    // Baby: trigger offer when parent announces it has joined
-    if (this.role === 'baby') {
-      ch.on('broadcast', { event: 'join' }, () => this.sendOffer());
+    if (this.role === 'parent') {
+      ch.on('broadcast', { event: 'audio_chunk' }, ({ payload }: any) => {
+        if (payload?.data) {
+          console.log(`[BabyGuard] parent received chunk, b64 len=${payload.data.length}, queue=${this.queue.length}`);
+          this.enqueue(payload.data as string);
+        }
+      });
     }
 
     await new Promise<void>((resolve, reject) => {
@@ -122,8 +124,8 @@ export class WebRTCSession {
       ch.subscribe(async (status: string) => {
         if (status === 'SUBSCRIBED') {
           clearTimeout(t);
-          // Publish presence so the other device can detect this room is active
           await ch.track({ role: this.role, at: Date.now() });
+          console.log(`[BabyGuard] channel subscribed as ${this.role} in room ${this.roomCode}`);
           resolve();
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
           clearTimeout(t);
@@ -131,100 +133,137 @@ export class WebRTCSession {
         }
       });
     });
-  }
 
-  // ─── Baby-side: send offer ──────────────────────────────────────
-
-  private async sendOffer() {
-    if (this.role !== 'baby' || !this.pc) return;
-    // Guard against duplicate offers if parent retries join
-    if ((this.pc as any).signalingState !== 'stable') return;
-
-    try {
-      const offer = await this.pc.createOffer({});
-      await this.pc.setLocalDescription(offer);
-      this.send('signal', { kind: 'offer', sdp: (offer as any).sdp });
-    } catch (err: any) {
-      console.error('[WebRTC] createOffer error', err?.message);
+    if (this.role === 'baby') {
+      this.recordLoop();
     }
   }
 
-  // ─── Shared: handle incoming signals ───────────────────────────
+  // ─── Baby: record → base64 → broadcast ───────────────────────────────────────
 
-  private async handleSignal(payload: any) {
-    const pc = this.pc;
-    if (!pc) return;
-    try {
-      if (payload.kind === 'offer') {
-        await pc.setRemoteDescription(
-          new RTCSessionDescription({ type: 'offer', sdp: payload.sdp }),
-        );
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        this.send('signal', { kind: 'answer', sdp: (answer as any).sdp });
-      } else if (payload.kind === 'answer') {
-        await pc.setRemoteDescription(
-          new RTCSessionDescription({ type: 'answer', sdp: payload.sdp }),
-        );
-      } else if (payload.kind === 'ice') {
-        await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+  private async recordLoop() {
+    const { granted } = await Audio.requestPermissionsAsync();
+    if (!granted) {
+      console.error('[BabyGuard] Microphone permission denied');
+      this.cb.onError('Microphone permission denied');
+      this.cb.onStatus('error');
+      return;
+    }
+
+    console.log('[BabyGuard] Recording loop started');
+    let chunkIndex = 0;
+
+    while (this.active) {
+      try {
+        const rec = new Audio.Recording();
+        await rec.prepareToRecordAsync(RECORDING_OPTIONS);
+        await rec.startAsync();
+        await sleep(CHUNK_MS);
+        await rec.stopAndUnloadAsync();
+
+        if (!this.active || !this.channel) break;
+
+        const uri = rec.getURI();
+        if (!uri) {
+          console.warn('[BabyGuard] getURI() returned null, skipping chunk');
+          continue;
+        }
+
+        const b64 = await FileSystem.readAsStringAsync(uri, {
+          encoding: 'base64',
+        });
+        FileSystem.deleteAsync(uri, { idempotent: true }); // fire-and-forget
+
+        chunkIndex++;
+        console.log(`[BabyGuard] chunk ${chunkIndex}: ${b64.length} base64 chars, broadcasting…`);
+
+        this.channel.send({
+          type: 'broadcast',
+          event: 'audio_chunk',
+          payload: { data: b64 },
+        });
+      } catch (err: any) {
+        console.error('[BabyGuard] recording error:', err?.message ?? err);
+        await sleep(200); // brief pause before retrying
       }
-    } catch (err: any) {
-      console.error('[WebRTC] handleSignal error', err?.message);
     }
+
+    console.log('[BabyGuard] Recording loop stopped');
   }
 
-  // ─── Helpers ───────────────────────────────────────────────────
+  // ─── Parent: queue → play sequentially ───────────────────────────────────────
 
-  private async acquireMic() {
-    this.localStream = await (mediaDevices as any).getUserMedia({
-      audio: true,
-      video: false,
-    });
-    this.localStream.getTracks().forEach((track: any) =>
-      this.pc!.addTrack(track, this.localStream),
-    );
-  }
-
-  private send(event: string, payload: object) {
-    this.channel?.send({ type: 'broadcast', event, payload });
-  }
-
-  private sendJoin() {
-    this.send('join', {});
-  }
-
-  private clearJoinRetry() {
-    if (this.joinRetry) {
-      clearInterval(this.joinRetry);
-      this.joinRetry = null;
+  private enqueue(b64: string) {
+    if (this.queue.length >= MAX_QUEUE) {
+      console.warn('[BabyGuard] queue full, dropping oldest chunk');
+      this.queue.shift();
     }
+    this.queue.push(b64);
+    if (!this.draining) this.drainQueue();
+  }
+
+  private async drainQueue() {
+    this.draining = true;
+    while (this.queue.length > 0 && this.active) {
+      const b64 = this.queue.shift()!;
+      const uri = `${FileSystem.cacheDirectory ?? ''}bg_${Date.now()}.m4a`;
+      try {
+        await FileSystem.writeAsStringAsync(uri, b64, {
+          encoding: 'base64',
+        });
+        const { sound } = await Audio.Sound.createAsync(
+          { uri },
+          { shouldPlay: true }, // start playing immediately on load
+        );
+        console.log('[BabyGuard] playing chunk…');
+        await new Promise<void>((resolve) => {
+          // Fallback timeout — never let a bad chunk stall the queue
+          const timeout = setTimeout(() => {
+            sound.unloadAsync().catch(() => {});
+            FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+            resolve();
+          }, CHUNK_MS + 500);
+
+          sound.setOnPlaybackStatusUpdate((s: AVPlaybackStatus) => {
+            if (s.isLoaded && s.didJustFinish) {
+              clearTimeout(timeout);
+              sound.unloadAsync().catch(() => {});
+              FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+              resolve();
+            }
+          });
+        });
+      } catch (err: any) {
+        console.error('[BabyGuard] playback error:', err?.message ?? err);
+        FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+      }
+    }
+    this.draining = false;
   }
 }
 
-// Convenience: check if a room is live (baby is in presence state).
-// Called by parent-join before navigating to parent-monitor.
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+function sleep(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms));
+}
+
 export async function checkRoomExists(code: string): Promise<boolean> {
   return new Promise((resolve) => {
     const ch = supabase.channel(`room:${code}`, {
       config: { presence: { key: `checker-${Date.now()}` } },
     });
-
     const timeout = setTimeout(() => {
       supabase.removeChannel(ch);
       resolve(false);
     }, 6000);
-
     ch.on('presence', { event: 'sync' }, () => {
       const state = ch.presenceState();
-      const babyOnline = Object.values(state)
-        .flat()
-        .some((p: any) => p.role === 'baby');
+      const babyOnline = Object.values(state).flat().some((p: any) => p.role === 'baby');
       clearTimeout(timeout);
       supabase.removeChannel(ch);
       resolve(babyOnline);
     });
-
     ch.subscribe();
   });
 }
